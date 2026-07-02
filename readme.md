@@ -6,7 +6,7 @@
 
 - 使用 OpenAI Chat Completions native tools。
 - 支持工具：`read_file(path)`、`write_file(path, content)`、`run_shell(command)`。
-- 最大执行步数：8 步，防止 Agent 无限循环。
+- 最大执行步数：50 步，防止 Agent 无限循环。
 - 自动读取 `.env` 中的模型配置。
 - 每次运行保存完整 trace 到 `runs/*.json`。
 - 支持回放 trace：`python3 agent.py trace runs/demo.json`。
