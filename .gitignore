@@ -2,3 +2,5 @@
 traces/
 runs/
 .env
+.pytest_cache/
+evals/
