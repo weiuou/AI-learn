@@ -15,6 +15,8 @@
 - 工具有风险等级、命令策略、项目目录边界、超时、输出截断和 human approval 中断点。
 - Eval 可以通过 trace 判断具体工具调用是 `allow`、`deny` 还是 `require_approval`。
 - 当 messages 超过 12000 字符时，会触发初版 context compression。
+- 每个新任务默认保存 checkpoint 到 `runs/{task_id}/`。
+- 支持 `TaskState`、`Context Pack`、工具结果摘要和 `agent resume <task_id>`。
 
 ## 环境配置
 
@@ -36,6 +38,19 @@ OPENAI_MODEL=gpt-4.1-mini
 python3 agent.py "读取 README，总结这个项目"
 ```
 
+指定任务 ID，便于恢复：
+
+```bash
+python3 agent.py "读取 README，总结这个项目" --task-id demo_readme
+```
+
+限制步数，模拟中断或未完成任务：
+
+```bash
+python3 agent.py "读取 README，再运行测试" --task-id demo_resume --max-steps 1
+python3 agent.py resume demo_resume
+```
+
 指定 trace 输出文件：
 
 ```bash
@@ -49,6 +64,28 @@ python3 agent.py trace runs/demo.json
 ```
 
 旧的 `traces/*.json` 文件也可以用同一个回放命令查看。
+
+## Checkpoint / Resume
+
+新任务默认写入：
+
+```text
+runs/{task_id}/trace.jsonl
+runs/{task_id}/state.json
+runs/{task_id}/context_pack.md
+```
+
+- `trace.jsonl` 是完整审计日志，保存每个模型调用、工具调用、工具完整 observation、压缩事件和 checkpoint 事件。
+- `state.json` 保存结构化 `TaskState`，包括用户目标、当前计划、已完成步骤、关键事实、触碰文件、最近错误和下一步建议。
+- `context_pack.md` 是下一轮模型调用使用的紧凑上下文，不再直接塞完整历史。
+
+恢复任务：
+
+```bash
+python3 agent.py resume <task_id>
+```
+
+恢复时会读取 `state.json` 和 `trace.jsonl`，重建 Context Pack，并只带上最近 1-2 轮压缩后的原始工具消息继续执行。
 
 ## ToolResult 格式
 
@@ -209,6 +246,26 @@ cache_hit_rate = cached_tokens / prompt_tokens
 
 触发后 trace 中会出现 `context_compressed` 事件。
 
+## Context Manager
+
+`agent/context_manager.py` 提供：
+
+- `build_context_pack(task_state, recent_trace, tool_summaries, max_chars=12000)`
+- `compress_tool_result(tool_name, tool_args, tool_result)`
+- `collect_recent_tool_summaries(trace, limit=5)`
+
+压缩规则：
+
+- shell `stdout/stderr` 超过 4000 字符时，Context Pack 只保留 head、tail 和 summary。
+- `read_file` 文件内容超过 8000 字符时，Context Pack 只保留文件路径、行号范围和片段。
+- 搜索型输出超过 5 条时，Context Pack 保留前 5 条和省略计数。
+- trace 仍保存工具返回的完整 observation；压缩只影响下一轮模型输入。
+
+Context Manager 和旧 `context_compressor.py` 的关系：
+
+- Context Manager 是默认路径，每轮都会构造 Context Pack。
+- `context_compressor.py` 作为兜底，只有短消息窗口仍超过 12000 字符时才触发。
+
 ## 验收命令
 
 语法检查：
@@ -222,6 +279,14 @@ python3 -m py_compile agent.py agent/*.py context_compressor.py eval_runner.py e
 ```bash
 python3 agent.py "读取 agent.py，说明这个 Agent Loop 是怎么工作的" --trace runs/read_agent.json
 python3 agent.py trace runs/read_agent.json
+```
+
+Checkpoint / resume：
+
+```bash
+python3 agent.py "读取 readme.md，再运行 pytest，总结下一步" --task-id demo_resume --max-steps 1
+python3 agent.py resume demo_resume
+python3 agent.py trace runs/demo_resume/trace.jsonl
 ```
 
 文件不存在后的恢复：

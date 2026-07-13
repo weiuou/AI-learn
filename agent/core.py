@@ -12,6 +12,20 @@ from context_compressor import (
     estimate_messages_size,
 )
 
+from .context_manager import (
+    build_context_pack,
+    collect_recent_tool_summaries,
+    compress_tool_result,
+    save_context_pack,
+)
+from .state import (
+    load_task_state,
+    new_task_state,
+    safe_task_id,
+    save_task_state,
+    update_task_state_from_trace,
+)
+
 
 def load_dotenv(path=".env"):
     if not os.path.exists(path):
@@ -35,6 +49,9 @@ load_dotenv()
 MODEL = os.getenv("OPENAI_MODEL", "MiniMax-M3")
 DEFAULT_TRACE_DIR = "runs"
 DEFAULT_API_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
+TRACE_JSONL_NAME = "trace.jsonl"
+STATE_JSON_NAME = "state.json"
+CONTEXT_PACK_NAME = "context_pack.md"
 
 client = None
 
@@ -274,12 +291,92 @@ def add_event(trace, event_type, attributes=None, step=None):
     )
 
 
+def make_task_id(value=None):
+    return safe_task_id(value or datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+
+def run_dir_for_task(task_id, base_dir=DEFAULT_TRACE_DIR):
+    return os.path.join(base_dir, safe_task_id(task_id))
+
+
+def artifact_paths(task_id, base_dir=DEFAULT_TRACE_DIR, run_dir=None):
+    directory = run_dir or run_dir_for_task(task_id, base_dir=base_dir)
+    return {
+        "run_dir": directory,
+        "trace": os.path.join(directory, TRACE_JSONL_NAME),
+        "state": os.path.join(directory, STATE_JSON_NAME),
+        "context_pack": os.path.join(directory, CONTEXT_PACK_NAME),
+    }
+
+
 def save_trace(trace, trace_path):
     directory = os.path.dirname(trace_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
+    if trace_path.endswith(".jsonl"):
+        metadata = {
+            key: value
+            for key, value in trace.items()
+            if key not in {"events"} and not key.startswith("_")
+        }
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"record_type": "trace", **metadata}, ensure_ascii=False) + "\n")
+            for event in trace.get("events", []):
+                f.write(json.dumps({"record_type": "event", **event}, ensure_ascii=False) + "\n")
+        return
     with open(trace_path, "w", encoding="utf-8") as f:
         json.dump(trace, f, ensure_ascii=False, indent=2)
+
+
+def load_trace(trace_path):
+    with open(trace_path, "r", encoding="utf-8") as f:
+        first = f.read(1)
+        f.seek(0)
+        if first == "[":
+            events = json.load(f)
+            return {
+                "schema_version": "agent-harness-trace-v1",
+                "events": events,
+            }
+
+        if trace_path.endswith(".jsonl"):
+            trace = {"schema_version": "agent-harness-trace-v1", "events": []}
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                record_type = record.pop("record_type", "event")
+                if record_type == "trace":
+                    trace.update(record)
+                elif record_type == "event":
+                    trace["events"].append(record)
+            return trace
+
+        return json.load(f)
+
+
+def new_trace(user_task, task_id=None):
+    resolved_task_id = make_task_id(task_id)
+    trace = {
+        "schema_version": "agent-harness-trace-v1",
+        "task_id": resolved_task_id,
+        "task": user_task,
+        "user_goal": user_task,
+        "started_at": now(),
+        "finished_at": None,
+        "events": [],
+    }
+    add_event(
+        trace,
+        "task_started",
+        {
+            "task_id": resolved_task_id,
+            "user_goal": user_task,
+            "token_estimate": estimate_text_tokens(user_task),
+        },
+    )
+    return trace
 
 
 from .tools import OPENAI_TOOLS, execute_tool
@@ -325,22 +422,206 @@ def maybe_compress_context(messages, trace, step):
     return compressed
 
 
-def run_agent(user_task, trace, max_steps=50):
-    messages = [
+def base_system_message():
+    return {
+        "role": "system",
+        "content": (
+            "你是一个最小 Agent Harness。"
+            "你可以通过工具读取文件、写文件、运行低风险 shell 命令。"
+            "工具返回的是统一 JSON：ok/result/error_type/message/recoverable/suggestion。"
+            "你每轮会收到 Context Pack，它是任务状态和历史摘要，不是完整聊天历史。"
+            "遇到 recoverable=true 的错误时，优先根据 suggestion 自己恢复，例如列目录、搜索文件、修正参数。"
+            "不要重复 Context Pack 中已经完成的步骤；从 next_action_hint 和最近工具结果继续。"
+            "当你已经获得足够信息后，不要再调用工具，直接用中文回答用户。"
+        ),
+    }
+
+
+def build_model_messages(user_task, context_pack, recent_messages):
+    return [
+        base_system_message(),
+        {"role": "user", "content": user_task},
         {
             "role": "system",
-            "content": (
-                "你是一个最小 Agent Harness。"
-                "你可以通过工具读取文件、写文件、运行低风险 shell 命令。"
-                "工具返回的是统一 JSON：ok/result/error_type/message/recoverable/suggestion。"
-                "遇到 recoverable=true 的错误时，优先根据 suggestion 自己恢复，例如列目录、搜索文件、修正参数。"
-                "当你已经获得足够信息后，不要再调用工具，直接用中文回答用户。"
-            ),
+            "content": context_pack,
         },
-        {"role": "user", "content": user_task},
-    ]
+    ] + list(recent_messages or [])
 
-    for step in range(1, max_steps + 1):
+
+def trim_recent_messages(messages, max_turns=2):
+    turns = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            turn = [message]
+            index += 1
+            expected = {
+                call.get("id")
+                for call in message.get("tool_calls", [])
+                if call.get("id")
+            }
+            while index < len(messages) and messages[index].get("role") == "tool":
+                turn.append(messages[index])
+                expected.discard(messages[index].get("tool_call_id"))
+                index += 1
+                if not expected:
+                    break
+            turns.append(turn)
+        else:
+            turns.append([message])
+            index += 1
+
+    kept = []
+    for turn in turns[-max_turns:]:
+        kept.extend(turn)
+    return kept
+
+
+def _max_trace_step(trace):
+    max_step = 0
+    for event in trace.get("events", []):
+        attrs = event.get("attributes") or event.get("data") or {}
+        step = event.get("step") or attrs.get("step")
+        if isinstance(step, int):
+            max_step = max(max_step, step)
+    return max_step
+
+
+def _recent_events(trace, limit=30):
+    return trace.get("events", [])[-limit:]
+
+
+def persist_checkpoint(trace, task_state, run_dir, context_pack, step=None):
+    if not run_dir:
+        return
+    paths = artifact_paths(task_state.task_id, run_dir=run_dir)
+    update_task_state_from_trace(task_state, trace)
+    add_event(
+        trace,
+        "task_state_updated",
+        {
+            "task_id": task_state.task_id,
+            "completed_steps": list(task_state.completed_steps),
+            "last_error": task_state.last_error,
+            "next_action_hint": task_state.next_action_hint,
+            "token_estimate": estimate_text_tokens(task_state.model_dump()),
+        },
+        step=step,
+    )
+    save_task_state(task_state, paths["state"])
+    save_context_pack(context_pack, paths["context_pack"])
+    add_event(
+        trace,
+        "checkpoint_saved",
+        {
+            "task_id": task_state.task_id,
+            "state_path": paths["state"],
+            "trace_path": paths["trace"],
+            "context_pack_path": paths["context_pack"],
+            "token_estimate": estimate_text_tokens(context_pack),
+        },
+        step=step,
+    )
+    save_trace(trace, paths["trace"])
+
+
+def prepare_context_pack(trace, task_state, step, run_dir=None):
+    update_task_state_from_trace(task_state, trace)
+    tool_summaries = collect_recent_tool_summaries(trace, limit=5)
+    context_pack = build_context_pack(
+        task_state,
+        _recent_events(trace, limit=24),
+        tool_summaries,
+    )
+    add_event(
+        trace,
+        "context_pack_built",
+        {
+            "step": step,
+            "task_id": task_state.task_id,
+            "chars": len(context_pack),
+            "tool_summaries": len(tool_summaries),
+            "token_estimate": estimate_text_tokens(context_pack),
+        },
+        step=step,
+    )
+    if run_dir:
+        save_context_pack(context_pack, artifact_paths(task_state.task_id, run_dir=run_dir)["context_pack"])
+    return context_pack
+
+
+def reconstruct_recent_messages(trace, max_turns=2):
+    turns = []
+    events = trace.get("events", [])
+    for event in events:
+        event_type = event.get("event_type") or event.get("type")
+        attrs = event.get("attributes") or event.get("data") or {}
+        if event_type != "llm_result":
+            continue
+        tool_calls = attrs.get("tool_calls") or []
+        if not tool_calls:
+            continue
+        assistant_message = {
+            "role": "assistant",
+            "content": attrs.get("content"),
+            "tool_calls": [
+                {
+                    "id": call.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name"),
+                        "arguments": call.get("arguments"),
+                    },
+                }
+                for call in tool_calls
+            ],
+        }
+        turn = [assistant_message]
+        wanted = {call.get("id") for call in tool_calls}
+        for result_event in events:
+            result_type = result_event.get("event_type") or result_event.get("type")
+            result_attrs = result_event.get("attributes") or result_event.get("data") or {}
+            if result_type != "tool_result" or result_attrs.get("tool_call.id") not in wanted:
+                continue
+            tool_name = result_attrs.get("tool_call.name") or result_attrs.get("tool")
+            tool_args = result_attrs.get("tool_call.arguments") or result_attrs.get("args") or {}
+            observation = result_attrs.get("observation") or result_attrs.get("result")
+            compact, _ = compress_tool_result(tool_name, tool_args if isinstance(tool_args, dict) else {}, observation)
+            turn.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": result_attrs.get("tool_call.id"),
+                    "content": json.dumps(compact, ensure_ascii=False),
+                }
+            )
+        turns.append(turn)
+
+    messages = []
+    for turn in turns[-max_turns:]:
+        messages.extend(turn)
+    return messages
+
+
+def run_agent(
+    user_task,
+    trace,
+    max_steps=50,
+    task_state=None,
+    run_dir=None,
+    recent_messages=None,
+    start_step=None,
+):
+    if task_state is None:
+        task_state = new_task_state(trace.get("task_id") or make_task_id(), user_task)
+    recent_messages = list(recent_messages or [])
+    if start_step is None:
+        start_step = _max_trace_step(trace) + 1
+    context_pack = prepare_context_pack(trace, task_state, start_step, run_dir=run_dir)
+
+    for step in range(start_step, max_steps + 1):
+        context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+        messages = build_model_messages(user_task, context_pack, recent_messages)
         messages = maybe_compress_context(messages, trace, step)
         input_summary = message_summary(messages)
         token_estimate = estimate_text_tokens(messages)
@@ -427,9 +708,11 @@ def run_agent(user_task, trace, max_steps=50):
                 },
                 step=step,
             )
+            context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+            persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
             return answer
 
-        messages.append(
+        assistant_recent_message = (
             {
                 "role": "assistant",
                 "content": message.content,
@@ -446,6 +729,7 @@ def run_agent(user_task, trace, max_steps=50):
                 ],
             }
         )
+        recent_messages.append(assistant_recent_message)
 
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
@@ -513,13 +797,38 @@ def run_agent(user_task, trace, max_steps=50):
                 step=step,
             )
 
-            messages.append(
+            compact_tool_result, compressed = compress_tool_result(
+                tool_name,
+                tool_args if isinstance(tool_args, dict) else {},
+                tool_result,
+            )
+            if compressed:
+                add_event(
+                    trace,
+                    "tool_result_compressed",
+                    {
+                        "step": step,
+                        "user_goal": user_task,
+                        "tool_call.id": tool_call.id,
+                        "tool_call.name": tool_name,
+                        "original_chars": len(json.dumps(tool_result, ensure_ascii=False)),
+                        "compressed_chars": len(json.dumps(compact_tool_result, ensure_ascii=False)),
+                        "summary": compact_tool_result.get("summary"),
+                        "token_estimate": estimate_text_tokens(compact_tool_result),
+                    },
+                    step=step,
+                )
+
+            recent_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(tool_result, ensure_ascii=False),
+                    "content": json.dumps(compact_tool_result, ensure_ascii=False),
                 }
             )
+            recent_messages = trim_recent_messages(recent_messages, max_turns=2)
+            context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+            persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
 
     answer = f"达到最大循环次数 {max_steps}，任务未完成。"
     add_event(
@@ -534,12 +843,9 @@ def run_agent(user_task, trace, max_steps=50):
         },
         step=max_steps,
     )
+    context_pack = prepare_context_pack(trace, task_state, max_steps, run_dir=run_dir)
+    persist_checkpoint(trace, task_state, run_dir, context_pack, step=max_steps)
     return answer
-
-
-def load_trace(trace_path):
-    with open(trace_path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def print_trace(trace_path):
@@ -634,9 +940,11 @@ def print_trace(trace_path):
 
 def parse_run_args(argv):
     if not argv:
-        return None, None
+        return None
 
     trace_path = None
+    task_id = None
+    max_steps = 50
     args = list(argv)
     if "--trace" in args:
         index = args.index("--trace")
@@ -645,15 +953,107 @@ def parse_run_args(argv):
         trace_path = args[index + 1]
         del args[index : index + 2]
 
+    if "--task-id" in args:
+        index = args.index("--task-id")
+        if index + 1 >= len(args):
+            raise ValueError("--task-id requires a value.")
+        task_id = make_task_id(args[index + 1])
+        del args[index : index + 2]
+
+    if "--max-steps" in args:
+        index = args.index("--max-steps")
+        if index + 1 >= len(args):
+            raise ValueError("--max-steps requires a number.")
+        try:
+            max_steps = int(args[index + 1])
+        except ValueError as e:
+            raise ValueError("--max-steps must be an integer.") from e
+        del args[index : index + 2]
+
     user_task = " ".join(args).strip()
     if not user_task:
         raise ValueError("No task specified. Please provide a task as a command-line argument.")
 
-    if trace_path is None:
-        trace_filename = datetime.now().strftime("%Y%m%d_%H%M%S.json")
-        trace_path = os.path.join(DEFAULT_TRACE_DIR, trace_filename)
+    task_id = task_id or make_task_id()
+    run_dir = run_dir_for_task(task_id)
+    paths = artifact_paths(task_id, run_dir=run_dir)
+    trace_path = trace_path or paths["trace"]
 
-    return user_task, trace_path
+    return {
+        "user_task": user_task,
+        "task_id": task_id,
+        "run_dir": run_dir,
+        "trace_path": trace_path,
+        "max_steps": max_steps,
+    }
+
+
+def parse_resume_args(argv):
+    if not argv:
+        raise ValueError("Usage: python3 agent.py resume <task_id> [--max-steps N]")
+
+    args = list(argv)
+    task_id = make_task_id(args.pop(0))
+    max_steps = 50
+
+    if "--max-steps" in args:
+        index = args.index("--max-steps")
+        if index + 1 >= len(args):
+            raise ValueError("--max-steps requires a number.")
+        try:
+            max_steps = int(args[index + 1])
+        except ValueError as e:
+            raise ValueError("--max-steps must be an integer.") from e
+        del args[index : index + 2]
+
+    if args:
+        raise ValueError(f"Unknown resume arguments: {' '.join(args)}")
+
+    return task_id, max_steps
+
+
+def resume_task(task_id, max_steps=50, base_dir=DEFAULT_TRACE_DIR):
+    run_dir = run_dir_for_task(task_id, base_dir=base_dir)
+    paths = artifact_paths(task_id, base_dir=base_dir, run_dir=run_dir)
+    if not os.path.exists(paths["state"]):
+        raise FileNotFoundError(f"Missing state checkpoint: {paths['state']}")
+    if not os.path.exists(paths["trace"]):
+        raise FileNotFoundError(f"Missing trace checkpoint: {paths['trace']}")
+
+    task_state = load_task_state(paths["state"])
+    trace = load_trace(paths["trace"])
+    trace["finished_at"] = None
+    add_event(
+        trace,
+        "resume_started",
+        {
+            "task_id": task_state.task_id,
+            "state_path": paths["state"],
+            "trace_path": paths["trace"],
+            "context_pack_path": paths["context_pack"],
+            "token_estimate": estimate_text_tokens(task_state.model_dump()),
+        },
+    )
+    recent_messages = reconstruct_recent_messages(trace, max_turns=2)
+    answer = run_agent(
+        task_state.user_goal,
+        trace,
+        max_steps=max_steps,
+        task_state=task_state,
+        run_dir=run_dir,
+        recent_messages=recent_messages,
+        start_step=_max_trace_step(trace) + 1,
+    )
+    trace["finished_at"] = now()
+    trace["usage_summary"] = summarize_usage(trace)
+    save_trace(trace, paths["trace"])
+    return answer, paths
+
+
+def _save_legacy_trace_if_needed(trace, trace_path, canonical_trace_path):
+    if not trace_path or trace_path == canonical_trace_path:
+        return
+    save_trace(trace, trace_path)
 
 
 def main():
@@ -680,36 +1080,64 @@ def main():
         run_eval(tasks_path, out_path)
         return
 
+    if sys.argv[1] == "resume":
+        try:
+            task_id, max_steps = parse_resume_args(sys.argv[2:])
+            answer, paths = resume_task(task_id, max_steps=max_steps)
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"Resumed task: {task_id}")
+        print("\nFinal Answer:")
+        print(answer)
+        print(f"Checkpoint saved to {paths['run_dir']}")
+        return
+
     try:
-        user_task, trace_path = parse_run_args(sys.argv[1:])
+        run_args = parse_run_args(sys.argv[1:])
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
 
+    user_task = run_args["user_task"]
+    task_id = run_args["task_id"]
+    run_dir = run_args["run_dir"]
+    trace_path = run_args["trace_path"]
+    paths = artifact_paths(task_id, run_dir=run_dir)
     print(f"Executing user task: {user_task}")
+    print(f"Task id: {task_id}")
 
-    trace = {
-        "schema_version": "agent-harness-trace-v1",
-        "task": user_task,
-        "user_goal": user_task,
-        "started_at": now(),
-        "finished_at": None,
-        "events": [],
-    }
-    add_event(trace, "task_started", {"user_goal": user_task, "token_estimate": estimate_text_tokens(user_task)})
+    trace = new_trace(user_task, task_id=task_id)
+    task_state = new_task_state(task_id, user_task)
 
     try:
-        answer = run_agent(user_task, trace, max_steps=50)
+        answer = run_agent(
+            user_task,
+            trace,
+            max_steps=run_args["max_steps"],
+            task_state=task_state,
+            run_dir=run_dir,
+        )
         print("\nFinal Answer:")
         print(answer)
+    except KeyboardInterrupt:
+        add_event(trace, "error", {"message": "Interrupted by user.", "token_estimate": 1})
+        context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
+        persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
+        print("\nInterrupted. Checkpoint saved; resume with:")
+        print(f"python3 agent.py resume {task_id}")
     except Exception as e:
         add_event(trace, "error", {"message": str(e), "token_estimate": estimate_text_tokens(str(e))})
+        context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
+        persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
         print(f"Error: {e}")
     finally:
         trace["finished_at"] = now()
         trace["usage_summary"] = summarize_usage(trace)
-        save_trace(trace, trace_path)
-        print(f"Trace saved to {trace_path}")
+        save_trace(trace, paths["trace"])
+        _save_legacy_trace_if_needed(trace, trace_path, paths["trace"])
+        print(f"Checkpoint saved to {paths['run_dir']}")
+        print(f"Trace saved to {paths['trace']}")
 
 
 if __name__ == "__main__":

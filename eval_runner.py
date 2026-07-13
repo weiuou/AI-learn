@@ -38,6 +38,31 @@ def _trace_has_error_type(trace, error_type):
     return False
 
 
+def _event_count(trace, event_type):
+    return sum(
+        1
+        for event in trace.get("events", [])
+        if (event.get("event_type") or event.get("type")) == event_type
+    )
+
+
+def _context_manager_stats(trace):
+    tool_compressions = _event_count(trace, "tool_result_compressed")
+    context_packs = _event_count(trace, "context_pack_built")
+    state_updates = _event_count(trace, "task_state_updated")
+    resume_events = _event_count(trace, "resume_started")
+    checkpoint_saves = _event_count(trace, "checkpoint_saved")
+    return {
+        "state_updates": state_updates,
+        "context_packs_built": context_packs,
+        "tool_results_compressed": tool_compressions,
+        "resume_events": resume_events,
+        "checkpoint_saves": checkpoint_saves,
+        "compression_effective": tool_compressions > 0 or context_packs > 0,
+        "resume_effective": resume_events > 0,
+    }
+
+
 def load_tasks(tasks_path):
     tasks = []
 
@@ -65,31 +90,14 @@ def load_tasks(tasks_path):
 
 
 def _new_trace(task):
-    from agent import add_event, estimate_text_tokens, now
+    from agent import new_trace
 
-    trace = {
-        "schema_version": "agent-harness-trace-v1",
-        "task_id": task["id"],
-        "task": task["prompt"],
-        "user_goal": task["prompt"],
-        "started_at": now(),
-        "finished_at": None,
-        "events": [],
-    }
-    add_event(
-        trace,
-        "task_started",
-        {
-            "task_id": task["id"],
-            "user_goal": task["prompt"],
-            "token_estimate": estimate_text_tokens(task["prompt"]),
-        },
-    )
-    return trace
+    return new_trace(task["prompt"], task_id=task["id"])
 
 
 def run_eval(tasks_path, out_path):
-    from agent import add_event, estimate_text_tokens, now, run_agent, save_trace, summarize_usage
+    from agent import add_event, artifact_paths, estimate_text_tokens, load_trace, now, resume_task, run_agent, save_trace, summarize_usage
+    from agent.state import load_task_state, new_task_state
 
     tasks = load_tasks(tasks_path)
     report_dir = os.path.dirname(out_path) or "."
@@ -101,12 +109,36 @@ def run_eval(tasks_path, out_path):
     for task in tasks:
         task_id = task["id"]
         max_steps = task.get("max_steps", 50)
-        trace_path = os.path.join(trace_dir, f"{_safe_task_id(task_id)}.json")
+        safe_id = _safe_task_id(task_id)
+        run_dir = os.path.join(trace_dir, safe_id)
+        paths = artifact_paths(safe_id, run_dir=run_dir)
+        trace_path = paths["trace"]
         trace = _new_trace(task)
+        task_state = new_task_state(safe_id, task["prompt"])
         final_answer = ""
 
         try:
-            final_answer = run_agent(task["prompt"], trace, max_steps=max_steps)
+            resume_after_steps = task.get("resume_after_steps")
+            if resume_after_steps:
+                run_agent(
+                    task["prompt"],
+                    trace,
+                    max_steps=resume_after_steps,
+                    task_state=task_state,
+                    run_dir=run_dir,
+                )
+                trace = load_trace(trace_path)
+                task_state = load_task_state(paths["state"])
+                final_answer, _ = resume_task(safe_id, max_steps=max_steps, base_dir=trace_dir)
+                trace = load_trace(trace_path)
+            else:
+                final_answer = run_agent(
+                    task["prompt"],
+                    trace,
+                    max_steps=max_steps,
+                    task_state=task_state,
+                    run_dir=run_dir,
+                )
         except Exception as e:
             final_answer = f"任务运行失败: {e}"
             error_type = _exception_error_type(e)
@@ -147,6 +179,8 @@ def run_eval(tasks_path, out_path):
             "checks": checks,
             "failure_reason": failure_reason,
             "trace_file": trace_path,
+            "run_dir": run_dir,
+            "context_manager": _context_manager_stats(trace),
             "final_answer_preview": _shorten(final_answer),
         }
         results.append(result)
@@ -171,14 +205,24 @@ def run_eval(tasks_path, out_path):
     for task in tasks:
         if task.get("id") not in security_task_ids:
             continue
-        trace_file = os.path.join(trace_dir, f"{_safe_task_id(task['id'])}.json")
+        trace_file = os.path.join(trace_dir, _safe_task_id(task["id"]), "trace.jsonl")
         try:
-            with open(trace_file, "r", encoding="utf-8") as f:
-                task_trace = json.load(f)
+            task_trace = load_trace(trace_file)
         except FileNotFoundError:
             continue
         if _trace_has_error_type(task_trace, "PERMISSION_DENIED"):
             permission_denied_hits += 1
+
+    context_stats = [result.get("context_manager") or {} for result in results]
+    context_manager_summary = {
+        "state_updates": sum(item.get("state_updates", 0) for item in context_stats),
+        "context_packs_built": sum(item.get("context_packs_built", 0) for item in context_stats),
+        "tool_results_compressed": sum(item.get("tool_results_compressed", 0) for item in context_stats),
+        "resume_events": sum(item.get("resume_events", 0) for item in context_stats),
+        "checkpoint_saves": sum(item.get("checkpoint_saves", 0) for item in context_stats),
+        "tasks_with_compression": sum(1 for item in context_stats if item.get("compression_effective")),
+        "tasks_with_resume": sum(1 for item in context_stats if item.get("resume_effective")),
+    }
 
     report = {
         "schema_version": "agent-harness-eval-report-v1",
@@ -194,6 +238,7 @@ def run_eval(tasks_path, out_path):
             "passed": sum(1 for result in security_results if result["passed"]),
             "permission_denied_hits": permission_denied_hits,
         },
+        "context_manager_summary": context_manager_summary,
         "results": results,
     }
 

@@ -10,11 +10,11 @@ def _casefold(value):
     return (value or "").casefold()
 
 
-def check_expected_contains(final_answer, keywords):
+def check_expected_contains(final_answer, keywords, extra_text=""):
     if not keywords:
         return True
 
-    answer = _casefold(final_answer)
+    answer = _casefold(final_answer + "\n" + (extra_text or ""))
     return all(_casefold(keyword) in answer for keyword in keywords)
 
 
@@ -128,9 +128,13 @@ def evaluate_task(trace, final_answer, task):
     checks = {}
 
     if "expected_contains" in task:
+        extra_text = ""
+        if task.get("category") == "context":
+            extra_text = str(trace)
         checks["expected_contains"] = check_expected_contains(
             final_answer,
             task.get("expected_contains") or [],
+            extra_text=extra_text,
         )
 
     if "expected_error_types" in task:
