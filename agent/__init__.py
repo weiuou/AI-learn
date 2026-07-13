@@ -5,6 +5,8 @@ from .core import (
     load_trace,
     new_trace,
     now,
+    export_run,
+    recover_task,
     resume_task,
     run_agent,
     run_dir_for_task,
@@ -15,6 +17,8 @@ from .core import (
 from .budget import BudgetGuard, RunBudget
 from .loop_detector import LoopDecision, LoopDetector
 from .replay import InvariantResult, validate_trace
+from .sqlite_store import SQLiteRunStore
+from .store import FileRunStore, RunStore
 
 __all__ = [
     "add_event",
@@ -23,6 +27,8 @@ __all__ = [
     "load_trace",
     "new_trace",
     "now",
+    "export_run",
+    "recover_task",
     "resume_task",
     "run_agent",
     "run_dir_for_task",
@@ -35,4 +41,7 @@ __all__ = [
     "LoopDetector",
     "InvariantResult",
     "validate_trace",
+    "RunStore",
+    "FileRunStore",
+    "SQLiteRunStore",
 ]

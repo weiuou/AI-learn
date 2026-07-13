@@ -18,6 +18,7 @@
 - 每个新任务默认保存 checkpoint 到 `runs/{task_id}/`。
 - 支持 `TaskState`、`Context Pack`、工具结果摘要和 `agent resume <task_id>`。
 - 支持 Run Budget、无进展循环检测和完全离线的 Replay Regression。
+- 支持可替换的 File / SQLite Run Store、原子 checkpoint 和崩溃恢复。
 
 ## 环境配置
 
@@ -70,6 +71,17 @@ python3 agent.py trace runs/demo.json
 python3 agent.py replay runs/demo_resume/trace.jsonl
 ```
 
+使用 SQLite Durable Runtime：
+
+```bash
+python3 agent.py "读取 README 并总结" --task-id durable_demo --store sqlite
+python3 agent.py resume durable_demo --store sqlite
+python3 agent.py export durable_demo --format jsonl --out runs/durable_demo.jsonl
+python3 agent.py replay runs/durable_demo.jsonl
+```
+
+SQLite 默认写入 `runs/agent.db`。普通命令仍默认使用文件模式；`--trace` 只适用于文件模式，SQLite run 需要通过 `export` 生成 JSONL。
+
 旧的 `traces/*.json` 文件也可以用同一个回放命令查看。
 
 ## Checkpoint / Resume
@@ -93,6 +105,20 @@ python3 agent.py resume <task_id>
 ```
 
 恢复时会读取 `state.json` 和 `trace.jsonl`，重建 Context Pack，并只带上最近 1-2 轮压缩后的原始工具消息继续执行。
+
+## Durable Runtime / Crash Recovery
+
+`RunStore` 把运行循环与持久化实现隔离。`FileRunStore` 保持上述三文件布局；`SQLiteRunStore` 使用 `runs`、`segments`、`events`、`checkpoints` 四张表，并保证 task 内事件序号严格递增。
+
+`resume` 和 `recover` 语义不同：`resume` 主动继续一个已经正常关闭的 segment；`recover` 只处理 SQLite 中最后一个没有关闭的 segment，从最后一次成功 checkpoint 创建 recovery segment：
+
+```bash
+python3 agent.py recover <task_id>
+```
+
+原 segment 会标记为 `crashed`。恢复只把历史工具 observation 转成上下文，不会重新执行历史工具；恢复之后模型新产生的工具调用仍按正常权限策略执行。SQLite checkpoint 在一个事务内写入 `checkpoint_started`、snapshot、run 状态和 `checkpoint_saved`，失败时整体回滚。
+
+设计说明见 [《Agent Harness 为什么需要 Durable Runtime》](docs/agent-durable-runtime.md)。
 
 ## ToolResult 格式
 

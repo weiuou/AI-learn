@@ -264,7 +264,7 @@ def update_task_state_from_trace(task_state, trace):
             _append_unique(pending_errors, error_summary, limit=50)
             task_state.next_action_hint = "Resume from the checkpoint and avoid repeating the failing action unchanged."
 
-        elif event_type == "resume_started":
+        elif event_type in {"resume_started", "recovery_started"}:
             saw_resume = True
 
         elif event_type == "checkpoint_saved":
