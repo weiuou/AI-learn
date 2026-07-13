@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from agent import export_run, new_trace, recover_task, resume_task, run_agent
-from agent.core import parse_export_args, parse_recover_args, parse_resume_args, parse_run_args
+from agent.core import (
+    _persist_interrupted_run,
+    parse_export_args,
+    parse_recover_args,
+    parse_resume_args,
+    parse_run_args,
+)
 from agent.replay import validate_trace
 from agent.sqlite_store import SQLITE_SCHEMA_VERSION, SQLiteRunStore
 from agent.state import new_task_state
@@ -133,7 +139,66 @@ def test_crashed_segment_can_recover(tmp_path):
     assert [segment["kind"] for segment in loaded["segments"]] == ["task", "recovery"]
     assert loaded["segments"][0]["exit_reason"] == "crashed"
     assert loaded["segments"][1]["exit_reason"] == "completed"
-    assert any(event["event_type"] == "recovery_started" for event in loaded["events"])
+    recovery_events = [event for event in loaded["events"] if event["event_type"] == "recovery_started"]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["attributes"]["previous_segment_id"] == "segment-1"
+    assert recovery_events[0]["attributes"]["segment_id"] == loaded["segments"][1]["segment_id"]
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "after_previous_segment_crashed",
+        "after_recovery_segment_created",
+        "after_recovery_run_updated",
+        "after_recovery_started_event",
+    ],
+)
+def test_recovery_handoff_is_atomic(tmp_path, failure_stage):
+    store = SQLiteRunStore(tmp_path / "agent.db")
+    _seed_open_run(store)
+
+    def fail(stage):
+        if stage == failure_stage:
+            raise RuntimeError("injected recovery handoff failure")
+
+    store.failure_injector = fail
+    with pytest.raises(RuntimeError, match="injected recovery"):
+        store.begin_recovery("durable", "segment-1", "recovery-1")
+
+    loaded = store.load_run("durable")
+    assert loaded["status"] == "running"
+    assert len(loaded["segments"]) == 1
+    assert loaded["segments"][0]["finished_at"] is None
+    assert loaded["segments"][0]["exit_reason"] is None
+    assert not any(event["event_type"] == "recovery_started" for event in loaded["events"])
+
+
+def test_recovery_handoff_success_is_consistent(tmp_path):
+    store = SQLiteRunStore(tmp_path / "agent.db")
+    _seed_open_run(store)
+    store.begin_recovery("durable", "segment-1", "recovery-1")
+
+    loaded = store.load_run("durable")
+    assert loaded["status"] == "running"
+    assert loaded["segments"][0]["exit_reason"] == "crashed"
+    assert loaded["segments"][0]["finished_at"] is not None
+    assert loaded["segments"][1]["kind"] == "recovery"
+    assert loaded["segments"][1]["finished_at"] is None
+    recovery_events = [event for event in loaded["events"] if event["event_type"] == "recovery_started"]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["attributes"] == {
+        "task_id": "durable",
+        "previous_segment_id": "segment-1",
+        "segment_id": "recovery-1",
+        "checkpoint_step": 1,
+    }
+    with sqlite3.connect(store.db_path) as connection:
+        event_segment = connection.execute(
+            "SELECT segment_id FROM events WHERE task_id=? AND event_type='recovery_started'",
+            ("durable",),
+        ).fetchone()[0]
+    assert event_segment == "recovery-1"
 
 
 def test_recovery_does_not_reexecute_tools(tmp_path):
@@ -266,3 +331,38 @@ def test_sqlite_resume_requires_closed_segment(tmp_path):
     loaded = store.load_run("durable")
     assert answer == "resumed"
     assert [segment["kind"] for segment in loaded["segments"]] == ["task", "resume"]
+
+
+def test_file_interrupted_run_can_resume(tmp_path):
+    store = FileRunStore(tmp_path)
+    store.create_run("file-interrupted", "goal")
+    store.start_segment("file-interrupted", "task-1", "task")
+    trace = new_trace("goal", task_id="file-interrupted")
+    trace["_store"] = store
+    trace["_segment_id"] = "task-1"
+    for event in trace["events"]:
+        store.append_event("file-interrupted", event)
+    task_state = new_task_state("file-interrupted", "goal")
+
+    _persist_interrupted_run(
+        trace,
+        task_state,
+        str(tmp_path / "file-interrupted"),
+        store,
+        "task-1",
+    )
+    interrupted = store.load_run("file-interrupted")
+    assert interrupted["segments"][0]["exit_reason"] == "interrupted"
+    assert interrupted["segments"][0]["finished_at"] is not None
+    assert any(event["event_type"] == "segment_interrupted" for event in interrupted["events"])
+
+    answer, _ = resume_task(
+        "file-interrupted",
+        store=store,
+        model_client=FakeClient("resumed"),
+    )
+    loaded = store.load_run("file-interrupted")
+    assert answer == "resumed"
+    assert [segment["kind"] for segment in loaded["segments"]] == ["task", "resume"]
+    assert loaded["segments"][1]["exit_reason"] == "completed"
+    assert all(result.passed for result in validate_trace(loaded["trace"]))

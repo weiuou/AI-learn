@@ -185,6 +185,64 @@ class SQLiteRunStore:
             )
             self._inject("after_checkpoint_saved")
 
+    def begin_recovery(
+        self,
+        task_id: str,
+        previous_segment_id: str,
+        recovery_segment_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if self._active_segment(connection, task_id) != previous_segment_id:
+                raise ValueError(f"Segment is not the active segment for run {task_id}: {previous_segment_id}")
+            checkpoint = connection.execute(
+                "SELECT step FROM checkpoints WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if checkpoint is None:
+                raise FileNotFoundError(f"Missing checkpoint for run: {task_id}")
+
+            changed_at = timestamp_now()
+            cursor = connection.execute(
+                """UPDATE segments SET finished_at=?, exit_reason='crashed'
+                   WHERE task_id=? AND segment_id=? AND finished_at IS NULL""",
+                (changed_at, task_id, previous_segment_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown or finished segment: {previous_segment_id}")
+            self._inject("after_previous_segment_crashed")
+
+            try:
+                connection.execute(
+                    """INSERT INTO segments(segment_id, task_id, kind, started_at)
+                       VALUES (?, ?, 'recovery', ?)""",
+                    (recovery_segment_id, task_id, changed_at),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"Cannot start recovery segment: {recovery_segment_id}") from error
+            self._inject("after_recovery_segment_created")
+
+            connection.execute(
+                "UPDATE runs SET status='running', updated_at=? WHERE task_id=?",
+                (changed_at, task_id),
+            )
+            self._inject("after_recovery_run_updated")
+
+            self._insert_event(
+                connection,
+                task_id,
+                make_event(
+                    "recovery_started",
+                    {
+                        "task_id": task_id,
+                        "previous_segment_id": previous_segment_id,
+                        "segment_id": recovery_segment_id,
+                        "checkpoint_step": checkpoint["step"],
+                    },
+                ),
+            )
+            self._inject("after_recovery_started_event")
+
     def load_run(self, task_id: str) -> dict:
         with self._connect() as connection:
             run = connection.execute("SELECT * FROM runs WHERE task_id=?", (task_id,)).fetchone()

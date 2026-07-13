@@ -1263,23 +1263,12 @@ def recover_task(
     if not open_segments:
         raise ValueError(f"Run has no crashed/open segment to recover: {task_id}")
     previous_segment_id = open_segments[-1]["segment_id"]
-    active_store.finish_segment(task_id, previous_segment_id, "crashed")
     segment_id = f"recovery-{uuid4().hex}"
-    active_store.start_segment(task_id, segment_id, "recovery")
+    active_store.begin_recovery(task_id, previous_segment_id, segment_id)
 
     trace = active_store.load_run(task_id)["trace"]
     trace["_store"] = active_store
     trace["_segment_id"] = segment_id
-    add_event(
-        trace,
-        "recovery_started",
-        {
-            "task_id": task_id,
-            "previous_segment_id": previous_segment_id,
-            "segment_id": segment_id,
-            "checkpoint_step": checkpoint["step"],
-        },
-    )
     task_state = TaskState.model_validate(checkpoint["state"])
     recent_messages = [{"role": "system", "content": checkpoint["context_pack"]}]
     recent_messages.extend(reconstruct_recent_messages(trace, max_turns=2))
@@ -1350,6 +1339,28 @@ def _save_legacy_trace_if_needed(trace, trace_path, canonical_trace_path):
     if not trace_path or trace_path == canonical_trace_path:
         return
     save_trace(trace, trace_path)
+
+
+def _persist_interrupted_run(trace, task_state, run_dir, active_store, segment_id):
+    add_event(trace, "error", {"message": "Interrupted by user.", "token_estimate": 1})
+    context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
+    persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
+    if not isinstance(active_store, FileRunStore):
+        return
+
+    add_event(
+        trace,
+        "segment_interrupted",
+        {
+            "task_id": task_state.task_id,
+            "segment_id": segment_id,
+            "exit_reason": "interrupted",
+        },
+        step=_max_trace_step(trace),
+    )
+    active_store.finish_segment(task_state.task_id, segment_id, "interrupted")
+    trace["_segment_finished"] = True
+    _sync_trace_from_store(trace, active_store)
 
 
 def main():
@@ -1469,10 +1480,14 @@ def main():
         print(answer)
     except KeyboardInterrupt:
         if trace is not None and task_state is not None:
-            add_event(trace, "error", {"message": "Interrupted by user.", "token_estimate": 1})
             effective_run_dir = run_dir if store_type == "file" else None
-            context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=effective_run_dir)
-            persist_checkpoint(trace, task_state, effective_run_dir, context_pack, step=_max_trace_step(trace))
+            _persist_interrupted_run(
+                trace,
+                task_state,
+                effective_run_dir,
+                active_store,
+                segment_id,
+            )
         print("\nInterrupted. Checkpoint saved.")
         follow_up = f"python3 agent.py resume {task_id}" if store_type == "file" else f"python3 agent.py recover {task_id}"
         print(f"Continue with: {follow_up}")

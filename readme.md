@@ -110,13 +110,13 @@ python3 agent.py resume <task_id>
 
 `RunStore` 把运行循环与持久化实现隔离。`FileRunStore` 保持上述三文件布局；`SQLiteRunStore` 使用 `runs`、`segments`、`events`、`checkpoints` 四张表，并保证 task 内事件序号严格递增。
 
-`resume` 和 `recover` 语义不同：`resume` 主动继续一个已经正常关闭的 segment；`recover` 只处理 SQLite 中最后一个没有关闭的 segment，从最后一次成功 checkpoint 创建 recovery segment：
+`resume` 和 `recover` 语义不同：`resume` 主动继续一个已经正常关闭的 segment；File 模式收到 `Ctrl+C` 时会保存 checkpoint、把当前 segment 关闭为 `interrupted`，然后可安全执行 `resume`。SQLite 模式收到 `Ctrl+C` 时保留开放 segment，由 `recover` 从最后一次成功 checkpoint 创建 recovery segment：
 
 ```bash
 python3 agent.py recover <task_id>
 ```
 
-原 segment 会标记为 `crashed`。恢复只把历史工具 observation 转成上下文，不会重新执行历史工具；恢复之后模型新产生的工具调用仍按正常权限策略执行。SQLite checkpoint 在一个事务内写入 `checkpoint_started`、snapshot、run 状态和 `checkpoint_saved`，失败时整体回滚。
+原 segment 会标记为 `crashed`。旧 segment 关闭、新 recovery segment 创建、run 状态更新和 `recovery_started` 事件写入在同一事务中完成。恢复只把历史工具 observation 转成上下文，不会重新执行历史工具；恢复之后模型新产生的工具调用仍按正常权限策略执行。SQLite checkpoint 在一个事务内写入 `checkpoint_started`、snapshot、run 状态和 `checkpoint_saved`，失败时整体回滚。
 
 设计说明见 [《Agent Harness 为什么需要 Durable Runtime》](docs/agent-durable-runtime.md)。
 
