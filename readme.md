@@ -17,6 +17,7 @@
 - 当 messages 超过 12000 字符时，会触发初版 context compression。
 - 每个新任务默认保存 checkpoint 到 `runs/{task_id}/`。
 - 支持 `TaskState`、`Context Pack`、工具结果摘要和 `agent resume <task_id>`。
+- 支持 Run Budget、无进展循环检测和完全离线的 Replay Regression。
 
 ## 环境配置
 
@@ -61,6 +62,12 @@ python3 agent.py "读取 README，总结这个项目" --trace runs/demo.json
 
 ```bash
 python3 agent.py trace runs/demo.json
+```
+
+离线验证 trace invariant（不会调用模型或真实工具）：
+
+```bash
+python3 agent.py replay runs/demo_resume/trace.jsonl
 ```
 
 旧的 `traces/*.json` 文件也可以用同一个回放命令查看。
@@ -142,6 +149,8 @@ trace 文件使用 JSON 保存，一次 Agent run 会记录这些事件：
 - `final_answer`
 - `protocol_error`
 - `error`
+- `budget_exceeded`
+- `loop_detected`
 
 每个事件包含：
 
@@ -194,6 +203,35 @@ cache_hit_rate = cached_tokens / prompt_tokens
 ```
 
 如果当前模型或 API provider 没有返回 cache 相关字段，回放时会显示 `Cache usage: unavailable`。如果没有返回任何 usage 字段，会显示 `API usage: unavailable`。
+
+## Run Budget
+
+`agent/budget.py` 将运行限制集中在独立的 `RunBudget` 与 `BudgetGuard` 中。Guard 在模型请求和工具执行之前检查限制，累计 step、模型调用、工具调用、所有 prompt 字符、墙钟耗时和连续工具失败。超限动作不会执行，trace 写入 `budget_exceeded`，终止原因统一为 `budget_exceeded`。
+
+```python
+RunBudget(
+    max_steps=20,
+    max_model_calls=20,
+    max_tool_calls=30,
+    max_prompt_chars=120_000,
+    max_wall_time_sec=300,
+    max_consecutive_failures=3,
+)
+```
+
+CLI 的 `--max-steps` 会覆盖当前运行段的 step 上限；模型调用仍受独立的 `max_model_calls` 限制。Trace 顶层 `budget_summary` 保存 limits、整条 trace 的 consumed、当前运行段的 `segment_consumed`、耗时和触发的限制。
+
+## Loop Detection
+
+`agent/loop_detector.py` 使用 `tool_name + normalized_arguments + error_type` 生成稳定动作指纹，检测同一动作连续三次、最近四个动作满足 `A/B/A/B` 且 `A != B`，以及没有成功 observation 的连续三次工具失败。
+
+第一次命中只注入一次结构化 recovery hint，要求模型重新规划。新的成功 observation 会结束恢复期；恢复后的再次失败或之后再次命中循环会停止运行并使用 `exit_reason=loop_detected`。Trace 只保存模式、相关 step 和指纹摘要，不保存隐式思维链。
+
+## Offline Replay Regression
+
+`agent/replay.py` 提供 `validate_trace(trace) -> list[InvariantResult]`。Replay 仅加载 JSON/JSONL，检查 trace schema、时间顺序、工具调用/结果配对、每个 task/resume 运行段唯一终止事件，以及 usage/budget summary 是否能从事件重算。每项 invariant 输出 PASS/FAIL；任一失败时 CLI 返回非零退出码。
+
+旧 trace 的 `exit_reason=no_tool_calls` 在 Eval 中兼容映射为 `completed`。包含 resume 的 trace 以 `task_started` 和 `resume_started` 分段，每段必须恰好包含一个 `final_answer`。
 
 ## Sandbox / Permission
 
@@ -316,6 +354,8 @@ python3 agent.py trace runs/cwd_escape.json
 python3 agent.py eval evals/tasks.jsonl --out runs/eval_report.json
 ```
 
+报告额外包含 `termination_summary`、`loop_detection` 和 `replay_regression`，用于观察终止分布、循环恢复效果和历史 trace invariant 回归结果。
+
 长上下文压缩：
 
 ```bash
@@ -337,5 +377,7 @@ python3 agent.py trace runs/compression.json
 - 更新 `.gitignore`，忽略 `.env` 和 `runs/`。
 
 ## 明天可以继续
+
+运行边界设计说明见 [《Agent 为什么需要预算、循环检测和离线回放》](docs/agent-runtime-guardrails.md)。
 
 下一步可以把 shell policy 从字符串规则升级为更可靠的命令解析，并补充网络权限、diff approval、以及基于历史 trace 的 replay regression。

@@ -5,6 +5,7 @@ from collections import Counter
 
 from evaluators import evaluate_task
 from failure_classifier import classify_failure
+from agent.replay import validate_trace
 
 
 def _safe_task_id(task_id):
@@ -44,6 +45,30 @@ def _event_count(trace, event_type):
         for event in trace.get("events", [])
         if (event.get("event_type") or event.get("type")) == event_type
     )
+
+
+def _canonical_exit_reason(trace):
+    final_events = [event for event in trace.get("events", []) if (event.get("event_type") or event.get("type")) == "final_answer"]
+    if not final_events:
+        return "runtime_error"
+    reason = (final_events[-1].get("attributes") or final_events[-1].get("data") or {}).get("exit_reason")
+    if reason == "no_tool_calls":
+        return "completed"
+    if reason in {"empty_content", None}:
+        return "runtime_error"
+    return reason
+
+
+def _loop_stats(trace):
+    loop_events = [event for event in trace.get("events", []) if (event.get("event_type") or event.get("type")) == "loop_detected"]
+    replans = sum(1 for event in loop_events if (event.get("attributes") or event.get("data") or {}).get("action") == "replan")
+    stops = sum(1 for event in loop_events if (event.get("attributes") or event.get("data") or {}).get("action") == "stop")
+    exit_reason = _canonical_exit_reason(trace)
+    return {
+        "detected": len(loop_events),
+        "recovered": 1 if replans and exit_reason != "loop_detected" else 0,
+        "stopped": stops,
+    }
 
 
 def _context_manager_stats(trace):
@@ -100,6 +125,8 @@ def run_eval(tasks_path, out_path):
     from agent.state import load_task_state, new_task_state
 
     tasks = load_tasks(tasks_path)
+    previous_non_interactive = os.environ.get("AGENT_NON_INTERACTIVE")
+    os.environ["AGENT_NON_INTERACTIVE"] = "1"
     report_dir = os.path.dirname(out_path) or "."
     trace_dir = os.path.join(report_dir, "evals")
     os.makedirs(trace_dir, exist_ok=True)
@@ -171,6 +198,8 @@ def run_eval(tasks_path, out_path):
         checks = evaluate_task(trace, final_answer, task)
         passed = all(checks.values()) if checks else True
         failure_reason = None if passed else classify_failure(trace, checks, task)
+        replay_results = validate_trace(trace)
+        replay_passed = all(item.passed for item in replay_results)
 
         result = {
             "task_id": task_id,
@@ -181,6 +210,12 @@ def run_eval(tasks_path, out_path):
             "trace_file": trace_path,
             "run_dir": run_dir,
             "context_manager": _context_manager_stats(trace),
+            "exit_reason": _canonical_exit_reason(trace),
+            "loop_detection": _loop_stats(trace),
+            "replay_regression": {
+                "passed": replay_passed,
+                "failures": [item.name for item in replay_results if not item.passed],
+            },
             "final_answer_preview": _shorten(final_answer),
         }
         results.append(result)
@@ -223,6 +258,26 @@ def run_eval(tasks_path, out_path):
         "tasks_with_compression": sum(1 for item in context_stats if item.get("compression_effective")),
         "tasks_with_resume": sum(1 for item in context_stats if item.get("resume_effective")),
     }
+    termination_summary = {
+        "completed": 0,
+        "max_steps": 0,
+        "budget_exceeded": 0,
+        "loop_detected": 0,
+        "runtime_error": 0,
+    }
+    for result in results:
+        reason = result.get("exit_reason")
+        if reason not in termination_summary:
+            reason = "runtime_error"
+        termination_summary[reason] += 1
+    loop_detection = {
+        key: sum((result.get("loop_detection") or {}).get(key, 0) for result in results)
+        for key in ["detected", "recovered", "stopped"]
+    }
+    replay_regression = {
+        "passed": sum(1 for result in results if (result.get("replay_regression") or {}).get("passed")),
+        "failed": sum(1 for result in results if not (result.get("replay_regression") or {}).get("passed")),
+    }
 
     report = {
         "schema_version": "agent-harness-eval-report-v1",
@@ -239,6 +294,9 @@ def run_eval(tasks_path, out_path):
             "permission_denied_hits": permission_denied_hits,
         },
         "context_manager_summary": context_manager_summary,
+        "termination_summary": termination_summary,
+        "loop_detection": loop_detection,
+        "replay_regression": replay_regression,
         "results": results,
     }
 
@@ -247,6 +305,10 @@ def run_eval(tasks_path, out_path):
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     print(f"Eval report saved to {out_path}", flush=True)
+    if previous_non_interactive is None:
+        os.environ.pop("AGENT_NON_INTERACTIVE", None)
+    else:
+        os.environ["AGENT_NON_INTERACTIVE"] = previous_non_interactive
     return report
 
 

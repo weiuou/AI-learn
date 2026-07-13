@@ -18,6 +18,9 @@ from .context_manager import (
     compress_tool_result,
     save_context_pack,
 )
+from .budget import BudgetGuard, RunBudget
+from .loop_detector import LoopDetector
+from .replay import recompute_budget_consumed
 from .state import (
     load_task_state,
     new_task_state,
@@ -216,6 +219,14 @@ def summarize_usage(trace):
     if summary["cache_usage_available"] and summary["prompt_tokens"]:
         summary["cache_hit_rate"] = summary["cached_tokens"] / summary["prompt_tokens"]
 
+    return summary
+
+
+def update_budget_summary(trace, budget_guard):
+    summary = budget_guard.summary()
+    summary["segment_consumed"] = summary.get("consumed") or {}
+    summary["consumed"] = recompute_budget_consumed(trace)
+    trace["budget_summary"] = summary
     return summary
 
 
@@ -611,20 +622,63 @@ def run_agent(
     run_dir=None,
     recent_messages=None,
     start_step=None,
+    budget=None,
+    budget_guard=None,
+    loop_detector=None,
+    model_client=None,
+    tool_executor=None,
+    clock=None,
 ):
     if task_state is None:
         task_state = new_task_state(trace.get("task_id") or make_task_id(), user_task)
     recent_messages = list(recent_messages or [])
     if start_step is None:
         start_step = _max_trace_step(trace) + 1
+    if budget is None:
+        budget = RunBudget(max_steps=max_steps)
+    if budget_guard is None:
+        guard_kwargs = {"budget": budget}
+        if clock is not None:
+            guard_kwargs["clock"] = clock
+        budget_guard = BudgetGuard(**guard_kwargs)
+    update_budget_summary(trace, budget_guard)
+    loop_detector = loop_detector or LoopDetector()
+    model_client = model_client or get_client()
+    tool_executor = tool_executor or execute_tool
     context_pack = prepare_context_pack(trace, task_state, start_step, run_dir=run_dir)
 
-    for step in range(start_step, max_steps + 1):
+    step = start_step
+    while True:
         context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
         messages = build_model_messages(user_task, context_pack, recent_messages)
         messages = maybe_compress_context(messages, trace, step)
         input_summary = message_summary(messages)
         token_estimate = estimate_text_tokens(messages)
+        prompt_chars = estimate_messages_size(messages)
+
+        exceeded = budget_guard.check_before_model(prompt_chars)
+        if exceeded:
+            answer = f"运行预算已超限：{exceeded.limit}。"
+            add_event(
+                trace,
+                "budget_exceeded",
+                {
+                    "step": step,
+                    "limit": exceeded.limit,
+                    "limit_value": exceeded.limit_value,
+                    "consumed": exceeded.consumed,
+                    "attempted": exceeded.attempted,
+                },
+                step=step,
+            )
+            add_event(trace, "final_answer", {"step": step, "user_goal": user_task, "answer": answer, "exit_reason": "budget_exceeded", "token_estimate": estimate_text_tokens(answer)}, step=step)
+            update_budget_summary(trace, budget_guard)
+            context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+            persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
+            return answer
+
+        budget_guard.record_model_call(prompt_chars)
+        update_budget_summary(trace, budget_guard)
 
         add_event(
             trace,
@@ -635,11 +689,12 @@ def run_agent(
                 "model": MODEL,
                 "model_input_summary": input_summary,
                 "token_estimate": token_estimate,
+                "prompt_chars": prompt_chars,
             },
             step=step,
         )
 
-        completion = get_client().chat.completions.create(
+        completion = model_client.chat.completions.create(
             model=MODEL,
             messages=messages,
             tools=OPENAI_TOOLS,
@@ -691,9 +746,9 @@ def run_agent(
                     step=step,
                 )
                 answer = "任务结束，但模型没有给出最终答案。"
-                exit_reason = "empty_content"
+                exit_reason = "runtime_error"
             else:
-                exit_reason = "no_tool_calls"
+                exit_reason = "completed"
 
             add_event(
                 trace,
@@ -708,6 +763,7 @@ def run_agent(
                 },
                 step=step,
             )
+            update_budget_summary(trace, budget_guard)
             context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
             persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
             return answer
@@ -730,6 +786,7 @@ def run_agent(
             }
         )
         recent_messages.append(assistant_recent_message)
+        pending_recovery_hint = None
 
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
@@ -743,6 +800,18 @@ def run_agent(
                 "truncated": False,
             }
 
+            exceeded = budget_guard.check_before_tool()
+            if exceeded:
+                answer = f"运行预算已超限：{exceeded.limit}。"
+                add_event(trace, "budget_exceeded", {"step": step, "limit": exceeded.limit, "limit_value": exceeded.limit_value, "consumed": exceeded.consumed, "attempted": exceeded.attempted}, step=step)
+                add_event(trace, "final_answer", {"step": step, "user_goal": user_task, "answer": answer, "exit_reason": "budget_exceeded", "token_estimate": estimate_text_tokens(answer)}, step=step)
+                update_budget_summary(trace, budget_guard)
+                context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+                persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
+                return answer
+            budget_guard.record_tool_call()
+            update_budget_summary(trace, budget_guard)
+
             try:
                 tool_args = json.loads(raw_args)
             except json.JSONDecodeError as e:
@@ -754,7 +823,7 @@ def run_agent(
                     "Call the tool again with valid JSON arguments.",
                 )
             else:
-                tool_result, tool_metadata = execute_tool({"tool": tool_name, "args": tool_args})
+                tool_result, tool_metadata = tool_executor({"tool": tool_name, "args": tool_args})
 
             add_event(
                 trace,
@@ -797,6 +866,38 @@ def run_agent(
                 step=step,
             )
 
+            budget_guard.record_tool_result(bool(tool_result.get("ok")))
+            update_budget_summary(trace, budget_guard)
+            loop_decision = loop_detector.observe(
+                tool_name,
+                tool_args,
+                tool_result.get("error_type"),
+                bool(tool_result.get("ok")),
+                step,
+            )
+            if loop_decision.detected:
+                add_event(
+                    trace,
+                    "loop_detected",
+                    {
+                        "step": step,
+                        "pattern": loop_decision.pattern,
+                        "related_steps": list(loop_decision.steps),
+                        "fingerprints": list(loop_decision.fingerprints),
+                        "action": "stop" if loop_decision.should_stop else "replan",
+                    },
+                    step=step,
+                )
+                if loop_decision.should_stop:
+                    answer = "检测到重复且无进展的工具循环，任务已停止。"
+                    add_event(trace, "final_answer", {"step": step, "user_goal": user_task, "answer": answer, "exit_reason": "loop_detected", "token_estimate": estimate_text_tokens(answer)}, step=step)
+                    update_budget_summary(trace, budget_guard)
+                    context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
+                    persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
+                    return answer
+                pending_recovery_hint = loop_decision.recovery_hint
+                budget_guard.grant_failure_recovery()
+
             compact_tool_result, compressed = compress_tool_result(
                 tool_name,
                 tool_args if isinstance(tool_args, dict) else {},
@@ -829,23 +930,11 @@ def run_agent(
             recent_messages = trim_recent_messages(recent_messages, max_turns=2)
             context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
             persist_checkpoint(trace, task_state, run_dir, context_pack, step=step)
-
-    answer = f"达到最大循环次数 {max_steps}，任务未完成。"
-    add_event(
-        trace,
-        "final_answer",
-        {
-            "step": max_steps,
-            "user_goal": user_task,
-            "answer": answer,
-            "exit_reason": "max_steps",
-            "token_estimate": estimate_text_tokens(answer),
-        },
-        step=max_steps,
-    )
-    context_pack = prepare_context_pack(trace, task_state, max_steps, run_dir=run_dir)
-    persist_checkpoint(trace, task_state, run_dir, context_pack, step=max_steps)
-    return answer
+        if pending_recovery_hint:
+            loop_detector.activate_recovery()
+            recent_messages.append({"role": "system", "content": json.dumps(pending_recovery_hint, ensure_ascii=False)})
+            recent_messages = trim_recent_messages(recent_messages, max_turns=2)
+        step += 1
 
 
 def print_trace(trace_path):
@@ -1078,6 +1167,22 @@ def main():
             sys.exit(1)
 
         run_eval(tasks_path, out_path)
+        return
+
+    if sys.argv[1] == "replay":
+        if len(sys.argv) != 3:
+            print("Usage: python3 agent.py replay <trace-file>")
+            sys.exit(1)
+        from .replay import print_replay_results, validate_trace
+
+        try:
+            replay_trace = load_trace(sys.argv[2])
+            replay_passed = print_replay_results(validate_trace(replay_trace))
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"Replay failed: {e}")
+            sys.exit(1)
+        if not replay_passed:
+            sys.exit(1)
         return
 
     if sys.argv[1] == "resume":

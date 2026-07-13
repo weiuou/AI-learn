@@ -10,7 +10,11 @@ from .core import (
     run_dir_for_task,
     save_trace,
     summarize_usage,
+    update_budget_summary,
 )
+from .budget import BudgetGuard, RunBudget
+from .loop_detector import LoopDecision, LoopDetector
+from .replay import InvariantResult, validate_trace
 
 __all__ = [
     "add_event",
@@ -24,4 +28,11 @@ __all__ = [
     "run_dir_for_task",
     "save_trace",
     "summarize_usage",
+    "update_budget_summary",
+    "BudgetGuard",
+    "RunBudget",
+    "LoopDecision",
+    "LoopDetector",
+    "InvariantResult",
+    "validate_trace",
 ]

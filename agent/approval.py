@@ -1,7 +1,10 @@
+import os
 import sys
 
 
 def is_interactive():
+    if os.getenv("AGENT_NON_INTERACTIVE", "").strip().casefold() in {"1", "true", "yes"}:
+        return False
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
