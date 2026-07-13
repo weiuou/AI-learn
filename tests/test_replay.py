@@ -68,6 +68,37 @@ def test_resume_trace_validates_each_segment():
     assert _result_map(trace)["segment_termination"].passed
 
 
+def test_interrupted_trace_passes_replay_before_resume():
+    trace = {
+        "schema_version": "agent-harness-trace-v1",
+        "events": [
+            _event("task_started", 0),
+            _event("segment_interrupted", 1, step=1, exit_reason="interrupted"),
+        ],
+    }
+    assert all(item.passed for item in validate_trace(trace))
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            _event("task_started", 0),
+            _event("segment_interrupted", 1, step=1, exit_reason="interrupted"),
+            _event("segment_interrupted", 2, step=1, exit_reason="interrupted"),
+        ],
+        [
+            _event("task_started", 0),
+            _event("segment_interrupted", 1, step=1, exit_reason="interrupted"),
+            _event("error", 2, step=1),
+        ],
+    ],
+)
+def test_interrupted_trace_requires_one_terminal_marker(events):
+    trace = {"schema_version": "agent-harness-trace-v1", "events": events}
+    assert not _result_map(trace)["segment_termination"].passed
+
+
 @pytest.mark.parametrize(
     "mutate,invariant",
     [

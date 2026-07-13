@@ -154,7 +154,7 @@ def _validate_terminations(trace):
     segments = []
     current = []
     for event in trace.get("events", []):
-        if _event_type(event) in {"task_started", "resume_started"}:
+        if _event_type(event) in {"task_started", "resume_started", "recovery_started"}:
             if current:
                 segments.append(current)
             current = [event]
@@ -163,8 +163,28 @@ def _validate_terminations(trace):
     if current:
         segments.append(current)
     counts = [sum(1 for event in segment if _event_type(event) == "final_answer") for segment in segments]
-    passed = bool(segments) and all(count == 1 for count in counts)
-    steps = [_step(segment[0]) or 0 for index, segment in enumerate(segments) if counts[index] != 1]
+    valid = []
+    for index, count in enumerate(counts):
+        interruption_events = [
+            event
+            for event in segments[index]
+            if _event_type(event) == "segment_interrupted"
+        ]
+        explicit_interruption = (
+            count == 0
+            and len(interruption_events) == 1
+            and _attrs(interruption_events[0]).get("exit_reason") == "interrupted"
+            and segments[index][-1] is interruption_events[0]
+        )
+        recovered_crash = (
+            count == 0
+            and index + 1 < len(segments)
+            and _event_type(segments[index + 1][0]) == "recovery_started"
+            and bool(_attrs(segments[index + 1][0]).get("previous_segment_id"))
+        )
+        valid.append(count == 1 or explicit_interruption or recovered_crash)
+    passed = bool(segments) and all(valid)
+    steps = [_step(segment[0]) or 0 for index, segment in enumerate(segments) if not valid[index]]
     return InvariantResult(
         name="segment_termination",
         passed=passed,

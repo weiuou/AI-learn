@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 
 from openai import OpenAI
 
@@ -21,13 +25,16 @@ from .context_manager import (
 from .budget import BudgetGuard, RunBudget
 from .loop_detector import LoopDetector
 from .replay import recompute_budget_consumed
+from .sqlite_store import SQLiteRunStore
 from .state import (
+    TaskState,
     load_task_state,
     new_task_state,
     safe_task_id,
     save_task_state,
     update_task_state_from_trace,
 )
+from .store import FileRunStore, RunStore, make_event
 
 
 def load_dotenv(path=".env"):
@@ -284,22 +291,12 @@ def message_summary(messages):
 
 
 def add_event(trace, event_type, attributes=None, step=None):
-    attrs = attributes or {}
-    if step is None:
-        step = attrs.get("step")
-    if step is not None:
-        attrs["step"] = step
-
-    trace["events"].append(
-        {
-            "event_type": event_type,
-            "type": event_type,
-            "step": step,
-            "timestamp": now(),
-            "attributes": attrs,
-            "data": attrs,
-        }
-    )
+    event = make_event(event_type, attributes, step)
+    trace["events"].append(event)
+    store = trace.get("_store")
+    if store is not None:
+        store.append_event(trace["task_id"], event)
+    return event
 
 
 def make_task_id(value=None):
@@ -503,10 +500,35 @@ def _recent_events(trace, limit=30):
     return trace.get("events", [])[-limit:]
 
 
+def _sync_trace_from_store(trace, store):
+    loaded = store.load_run(trace["task_id"])
+    stored_trace = loaded["trace"]
+    trace["events"] = list(stored_trace.get("events", []))
+    for key in ["segments", "status", "started_at", "finished_at"]:
+        if key in stored_trace:
+            trace[key] = stored_trace[key]
+        elif key in loaded:
+            trace[key] = loaded[key]
+
+
+def _latest_exit_reason(trace):
+    for event in reversed(trace.get("events", [])):
+        if (event.get("event_type") or event.get("type")) == "final_answer":
+            attrs = event.get("attributes") or event.get("data") or {}
+            return attrs.get("exit_reason") or "completed"
+        if (event.get("event_type") or event.get("type")) in {
+            "task_started",
+            "resume_started",
+            "recovery_started",
+        }:
+            break
+    return None
+
+
 def persist_checkpoint(trace, task_state, run_dir, context_pack, step=None):
-    if not run_dir:
+    store = trace.get("_store")
+    if not run_dir and store is None:
         return
-    paths = artifact_paths(task_state.task_id, run_dir=run_dir)
     update_task_state_from_trace(task_state, trace)
     add_event(
         trace,
@@ -520,20 +542,26 @@ def persist_checkpoint(trace, task_state, run_dir, context_pack, step=None):
         },
         step=step,
     )
+    if store is not None:
+        store.save_checkpoint(
+            task_state.task_id,
+            task_state.model_dump(),
+            context_pack,
+            step or 0,
+        )
+        _sync_trace_from_store(trace, store)
+        exit_reason = _latest_exit_reason(trace)
+        segment_id = trace.get("_segment_id")
+        if exit_reason and segment_id and not trace.get("_segment_finished"):
+            store.finish_segment(task_state.task_id, segment_id, exit_reason)
+            trace["_segment_finished"] = True
+            _sync_trace_from_store(trace, store)
+        return
+
+    paths = artifact_paths(task_state.task_id, run_dir=run_dir)
     save_task_state(task_state, paths["state"])
     save_context_pack(context_pack, paths["context_pack"])
-    add_event(
-        trace,
-        "checkpoint_saved",
-        {
-            "task_id": task_state.task_id,
-            "state_path": paths["state"],
-            "trace_path": paths["trace"],
-            "context_pack_path": paths["context_pack"],
-            "token_estimate": estimate_text_tokens(context_pack),
-        },
-        step=step,
-    )
+    add_event(trace, "checkpoint_saved", {"task_id": task_state.task_id}, step=step)
     save_trace(trace, paths["trace"])
 
 
@@ -557,7 +585,7 @@ def prepare_context_pack(trace, task_state, step, run_dir=None):
         },
         step=step,
     )
-    if run_dir:
+    if run_dir and trace.get("_store") is None:
         save_context_pack(context_pack, artifact_paths(task_state.task_id, run_dir=run_dir)["context_pack"])
     return context_pack
 
@@ -628,7 +656,30 @@ def run_agent(
     model_client=None,
     tool_executor=None,
     clock=None,
+    store: RunStore | None = None,
+    segment_id: str | None = None,
 ):
+    if store is None and run_dir:
+        store = FileRunStore(Path(run_dir).parent)
+        try:
+            loaded = store.load_run(trace.get("task_id"))
+        except FileNotFoundError:
+            store.create_run(trace.get("task_id"), user_task)
+            segment_id = segment_id or f"task-{uuid4().hex}"
+            store.start_segment(trace.get("task_id"), segment_id, "task")
+            for existing_event in trace.get("events", []):
+                store.append_event(trace.get("task_id"), existing_event)
+        else:
+            open_segments = [item for item in loaded.get("segments", []) if item.get("finished_at") is None]
+            if open_segments:
+                segment_id = segment_id or open_segments[-1]["segment_id"]
+            elif segment_id is None:
+                segment_id = f"task-{uuid4().hex}"
+                store.start_segment(trace.get("task_id"), segment_id, "task")
+    if store is not None:
+        trace["_store"] = store
+        trace["_segment_id"] = segment_id
+
     if task_state is None:
         task_state = new_task_state(trace.get("task_id") or make_task_id(), user_task)
     recent_messages = list(recent_messages or [])
@@ -1034,7 +1085,17 @@ def parse_run_args(argv):
     trace_path = None
     task_id = None
     max_steps = 50
+    store_type = "file"
     args = list(argv)
+    trace_requested = "--trace" in args
+    if "--store" in args:
+        index = args.index("--store")
+        if index + 1 >= len(args):
+            raise ValueError("--store requires file or sqlite.")
+        store_type = args[index + 1]
+        if store_type not in {"file", "sqlite"}:
+            raise ValueError("--store must be file or sqlite.")
+        del args[index : index + 2]
     if "--trace" in args:
         index = args.index("--trace")
         if index + 1 >= len(args):
@@ -1067,6 +1128,8 @@ def parse_run_args(argv):
     run_dir = run_dir_for_task(task_id)
     paths = artifact_paths(task_id, run_dir=run_dir)
     trace_path = trace_path or paths["trace"]
+    if store_type == "sqlite" and trace_requested:
+        raise ValueError("--trace cannot be combined with --store sqlite; use export after the run.")
 
     return {
         "user_task": user_task,
@@ -1074,6 +1137,7 @@ def parse_run_args(argv):
         "run_dir": run_dir,
         "trace_path": trace_path,
         "max_steps": max_steps,
+        "store_type": store_type,
     }
 
 
@@ -1084,6 +1148,16 @@ def parse_resume_args(argv):
     args = list(argv)
     task_id = make_task_id(args.pop(0))
     max_steps = 50
+    store_type = "file"
+
+    if "--store" in args:
+        index = args.index("--store")
+        if index + 1 >= len(args):
+            raise ValueError("--store requires file or sqlite.")
+        store_type = args[index + 1]
+        if store_type not in {"file", "sqlite"}:
+            raise ValueError("--store must be file or sqlite.")
+        del args[index : index + 2]
 
     if "--max-steps" in args:
         index = args.index("--max-steps")
@@ -1098,51 +1172,195 @@ def parse_resume_args(argv):
     if args:
         raise ValueError(f"Unknown resume arguments: {' '.join(args)}")
 
-    return task_id, max_steps
+    return task_id, max_steps, store_type
 
 
-def resume_task(task_id, max_steps=50, base_dir=DEFAULT_TRACE_DIR):
-    run_dir = run_dir_for_task(task_id, base_dir=base_dir)
-    paths = artifact_paths(task_id, base_dir=base_dir, run_dir=run_dir)
-    if not os.path.exists(paths["state"]):
-        raise FileNotFoundError(f"Missing state checkpoint: {paths['state']}")
-    if not os.path.exists(paths["trace"]):
-        raise FileNotFoundError(f"Missing trace checkpoint: {paths['trace']}")
+def _resolve_store(store_type="file", base_dir=DEFAULT_TRACE_DIR, store=None):
+    if store is not None:
+        return store
+    if store_type == "sqlite":
+        return SQLiteRunStore(Path(base_dir) / "agent.db")
+    return FileRunStore(base_dir)
 
-    task_state = load_task_state(paths["state"])
-    trace = load_trace(paths["trace"])
-    trace["finished_at"] = None
+
+def _persist_trace_metadata_if_file(store, trace, task_id, base_dir):
+    if isinstance(store, FileRunStore):
+        save_trace(trace, str(Path(store.base_dir) / task_id / TRACE_JSONL_NAME))
+
+
+def resume_task(
+    task_id,
+    max_steps=50,
+    base_dir=DEFAULT_TRACE_DIR,
+    store_type="file",
+    store=None,
+    model_client=None,
+    tool_executor=None,
+):
+    active_store = _resolve_store(store_type, base_dir, store)
+    loaded = active_store.load_run(task_id)
+    if any(item.get("finished_at") is None for item in loaded.get("segments", [])):
+        raise ValueError("Cannot resume a run with an open segment; use recover for a crashed SQLite run.")
+    checkpoint = loaded.get("checkpoint")
+    if checkpoint is None:
+        raise FileNotFoundError(f"Missing checkpoint for run: {task_id}")
+
+    task_state = TaskState.model_validate(checkpoint["state"])
+    trace = loaded["trace"]
+    segment_id = f"resume-{uuid4().hex}"
+    active_store.start_segment(task_id, segment_id, "resume")
+    trace["_store"] = active_store
+    trace["_segment_id"] = segment_id
     add_event(
         trace,
         "resume_started",
         {
             "task_id": task_state.task_id,
-            "state_path": paths["state"],
-            "trace_path": paths["trace"],
-            "context_pack_path": paths["context_pack"],
+            "segment_id": segment_id,
             "token_estimate": estimate_text_tokens(task_state.model_dump()),
         },
     )
-    recent_messages = reconstruct_recent_messages(trace, max_turns=2)
+    recent_messages = [{"role": "system", "content": checkpoint["context_pack"]}]
+    recent_messages.extend(reconstruct_recent_messages(trace, max_turns=2))
     answer = run_agent(
         task_state.user_goal,
         trace,
         max_steps=max_steps,
         task_state=task_state,
-        run_dir=run_dir,
+        run_dir=run_dir_for_task(task_id, base_dir=base_dir) if store_type == "file" else None,
         recent_messages=recent_messages,
         start_step=_max_trace_step(trace) + 1,
+        model_client=model_client,
+        tool_executor=tool_executor,
+        store=active_store,
+        segment_id=segment_id,
     )
-    trace["finished_at"] = now()
     trace["usage_summary"] = summarize_usage(trace)
-    save_trace(trace, paths["trace"])
+    _persist_trace_metadata_if_file(active_store, trace, task_id, base_dir)
+    effective_base_dir = str(active_store.base_dir) if isinstance(active_store, FileRunStore) else base_dir
+    paths = artifact_paths(task_id, base_dir=effective_base_dir)
+    if store_type == "sqlite" or isinstance(active_store, SQLiteRunStore):
+        paths = {**paths, "database": str(active_store.db_path)}
     return answer, paths
+
+
+def recover_task(
+    task_id,
+    max_steps=50,
+    base_dir=DEFAULT_TRACE_DIR,
+    store=None,
+    model_client=None,
+    tool_executor=None,
+):
+    active_store = _resolve_store("sqlite", base_dir, store)
+    if not isinstance(active_store, SQLiteRunStore):
+        raise ValueError("Crash recovery requires SQLiteRunStore.")
+    loaded = active_store.load_run(task_id)
+    checkpoint = loaded.get("checkpoint")
+    if checkpoint is None:
+        raise FileNotFoundError(f"Missing checkpoint for run: {task_id}")
+    open_segments = [item for item in loaded.get("segments", []) if item.get("finished_at") is None]
+    if not open_segments:
+        raise ValueError(f"Run has no crashed/open segment to recover: {task_id}")
+    previous_segment_id = open_segments[-1]["segment_id"]
+    segment_id = f"recovery-{uuid4().hex}"
+    active_store.begin_recovery(task_id, previous_segment_id, segment_id)
+
+    trace = active_store.load_run(task_id)["trace"]
+    trace["_store"] = active_store
+    trace["_segment_id"] = segment_id
+    task_state = TaskState.model_validate(checkpoint["state"])
+    recent_messages = [{"role": "system", "content": checkpoint["context_pack"]}]
+    recent_messages.extend(reconstruct_recent_messages(trace, max_turns=2))
+    answer = run_agent(
+        task_state.user_goal,
+        trace,
+        max_steps=max_steps,
+        task_state=task_state,
+        recent_messages=recent_messages,
+        start_step=max(checkpoint["step"] + 1, _max_trace_step(trace) + 1),
+        model_client=model_client,
+        tool_executor=tool_executor,
+        store=active_store,
+        segment_id=segment_id,
+    )
+    trace["usage_summary"] = summarize_usage(trace)
+    return answer, {"database": str(active_store.db_path), "task_id": task_id}
+
+
+def export_run(task_id, out_path, base_dir=DEFAULT_TRACE_DIR, store=None):
+    active_store = _resolve_store("sqlite", base_dir, store)
+    if not isinstance(active_store, SQLiteRunStore):
+        raise ValueError("SQLite export requires SQLiteRunStore.")
+    trace = active_store.load_run(task_id)["trace"]
+    trace["usage_summary"] = summarize_usage(trace)
+    save_trace(trace, str(out_path))
+    return str(out_path)
+
+
+def parse_export_args(argv):
+    if not argv:
+        raise ValueError("Usage: python3 agent.py export <task_id> --format jsonl --out <path>")
+    args = list(argv)
+    task_id = make_task_id(args.pop(0))
+    export_format = None
+    out_path = None
+    if "--format" in args:
+        index = args.index("--format")
+        if index + 1 >= len(args):
+            raise ValueError("--format requires jsonl.")
+        export_format = args[index + 1]
+        del args[index : index + 2]
+    if "--out" in args:
+        index = args.index("--out")
+        if index + 1 >= len(args):
+            raise ValueError("--out requires a path.")
+        out_path = args[index + 1]
+        del args[index : index + 2]
+    if args:
+        raise ValueError(f"Unknown export arguments: {' '.join(args)}")
+    if export_format != "jsonl":
+        raise ValueError("Only --format jsonl is supported.")
+    if not out_path:
+        raise ValueError("--out is required.")
+    return task_id, out_path
+
+
+def parse_recover_args(argv):
+    if not argv:
+        raise ValueError("Usage: python3 agent.py recover <task_id> [--max-steps N]")
+    task_id, max_steps, store_type = parse_resume_args(argv)
+    if store_type != "file":
+        raise ValueError("recover always uses the default SQLite store; omit --store.")
+    return task_id, max_steps
 
 
 def _save_legacy_trace_if_needed(trace, trace_path, canonical_trace_path):
     if not trace_path or trace_path == canonical_trace_path:
         return
     save_trace(trace, trace_path)
+
+
+def _persist_interrupted_run(trace, task_state, run_dir, active_store, segment_id):
+    add_event(trace, "error", {"message": "Interrupted by user.", "token_estimate": 1})
+    context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
+    persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
+    if not isinstance(active_store, FileRunStore):
+        return
+
+    add_event(
+        trace,
+        "segment_interrupted",
+        {
+            "task_id": task_state.task_id,
+            "segment_id": segment_id,
+            "exit_reason": "interrupted",
+        },
+        step=_max_trace_step(trace),
+    )
+    active_store.finish_segment(task_state.task_id, segment_id, "interrupted")
+    trace["_segment_finished"] = True
+    _sync_trace_from_store(trace, active_store)
 
 
 def main():
@@ -1187,15 +1405,38 @@ def main():
 
     if sys.argv[1] == "resume":
         try:
-            task_id, max_steps = parse_resume_args(sys.argv[2:])
-            answer, paths = resume_task(task_id, max_steps=max_steps)
+            task_id, max_steps, store_type = parse_resume_args(sys.argv[2:])
+            answer, paths = resume_task(task_id, max_steps=max_steps, store_type=store_type)
         except Exception as e:
             print(f"Error: {e}")
             sys.exit(1)
         print(f"Resumed task: {task_id}")
         print("\nFinal Answer:")
         print(answer)
-        print(f"Checkpoint saved to {paths['run_dir']}")
+        print(f"Checkpoint saved to {paths.get('database') or paths['run_dir']}")
+        return
+
+    if sys.argv[1] == "recover":
+        try:
+            task_id, max_steps = parse_recover_args(sys.argv[2:])
+            answer, paths = recover_task(task_id, max_steps=max_steps)
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"Recovered task: {task_id}")
+        print("\nFinal Answer:")
+        print(answer)
+        print(f"Checkpoint saved to {paths['database']}")
+        return
+
+    if sys.argv[1] == "export":
+        try:
+            task_id, out_path = parse_export_args(sys.argv[2:])
+            export_run(task_id, out_path)
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"Exported task {task_id} to {out_path}")
         return
 
     try:
@@ -1206,43 +1447,67 @@ def main():
 
     user_task = run_args["user_task"]
     task_id = run_args["task_id"]
+    store_type = run_args["store_type"]
     run_dir = run_args["run_dir"]
     trace_path = run_args["trace_path"]
     paths = artifact_paths(task_id, run_dir=run_dir)
     print(f"Executing user task: {user_task}")
     print(f"Task id: {task_id}")
 
-    trace = new_trace(user_task, task_id=task_id)
-    task_state = new_task_state(task_id, user_task)
-
+    trace = None
+    task_state = None
     try:
+        active_store = _resolve_store(store_type)
+        active_store.create_run(task_id, user_task)
+        segment_id = f"task-{uuid4().hex}"
+        active_store.start_segment(task_id, segment_id, "task")
+        trace = new_trace(user_task, task_id=task_id)
+        trace["_store"] = active_store
+        trace["_segment_id"] = segment_id
+        for event in trace["events"]:
+            active_store.append_event(task_id, event)
+        task_state = new_task_state(task_id, user_task)
         answer = run_agent(
             user_task,
             trace,
             max_steps=run_args["max_steps"],
             task_state=task_state,
-            run_dir=run_dir,
+            run_dir=run_dir if store_type == "file" else None,
+            store=active_store,
+            segment_id=segment_id,
         )
         print("\nFinal Answer:")
         print(answer)
     except KeyboardInterrupt:
-        add_event(trace, "error", {"message": "Interrupted by user.", "token_estimate": 1})
-        context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
-        persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
-        print("\nInterrupted. Checkpoint saved; resume with:")
-        print(f"python3 agent.py resume {task_id}")
+        if trace is not None and task_state is not None:
+            effective_run_dir = run_dir if store_type == "file" else None
+            _persist_interrupted_run(
+                trace,
+                task_state,
+                effective_run_dir,
+                active_store,
+                segment_id,
+            )
+        print("\nInterrupted. Checkpoint saved.")
+        follow_up = f"python3 agent.py resume {task_id}" if store_type == "file" else f"python3 agent.py recover {task_id}"
+        print(f"Continue with: {follow_up}")
     except Exception as e:
-        add_event(trace, "error", {"message": str(e), "token_estimate": estimate_text_tokens(str(e))})
-        context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=run_dir)
-        persist_checkpoint(trace, task_state, run_dir, context_pack, step=_max_trace_step(trace))
+        if trace is not None and task_state is not None:
+            add_event(trace, "error", {"message": str(e), "token_estimate": estimate_text_tokens(str(e))})
+            effective_run_dir = run_dir if store_type == "file" else None
+            context_pack = prepare_context_pack(trace, task_state, _max_trace_step(trace), run_dir=effective_run_dir)
+            persist_checkpoint(trace, task_state, effective_run_dir, context_pack, step=_max_trace_step(trace))
         print(f"Error: {e}")
     finally:
-        trace["finished_at"] = now()
-        trace["usage_summary"] = summarize_usage(trace)
-        save_trace(trace, paths["trace"])
-        _save_legacy_trace_if_needed(trace, trace_path, paths["trace"])
-        print(f"Checkpoint saved to {paths['run_dir']}")
-        print(f"Trace saved to {paths['trace']}")
+        if trace is not None:
+            trace["usage_summary"] = summarize_usage(trace)
+            if store_type == "file":
+                save_trace(trace, paths["trace"])
+                _save_legacy_trace_if_needed(trace, trace_path, paths["trace"])
+                print(f"Checkpoint saved to {paths['run_dir']}")
+                print(f"Trace saved to {paths['trace']}")
+            else:
+                print(f"Checkpoint saved to {Path(DEFAULT_TRACE_DIR) / 'agent.db'}")
 
 
 if __name__ == "__main__":
