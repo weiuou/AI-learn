@@ -1,0 +1,54 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: workspace-agent-web:latest
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      APP_DATA_ROOT: /app/data
+      HOST_DATA_ROOT: ${HOST_DATA_ROOT:?Set HOST_DATA_ROOT to an absolute VPS path}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      INVITE_USERS_JSON: ${INVITE_USERS_JSON:?Set INVITE_USERS_JSON}
+      SECURE_COOKIES: "true"
+      SANDBOX_IMAGE: workspace-sandbox:latest
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+    volumes:
+      - ${HOST_DATA_ROOT}:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  sandbox-image:
+    profiles: ["build-only"]
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    image: workspace-sandbox:latest
+    command: ["true"]
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,1 +1,4 @@
+-r requirements.txt
 pytest>=8,<9
+httpx>=0.28,<1
+urllib3<2; python_version < "3.10" and sys_platform == "darwin"

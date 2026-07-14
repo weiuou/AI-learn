@@ -2,6 +2,92 @@
 
 这是一个不用 LangChain / LangGraph、手写实现的最小 Agent Harness。项目从最小 Agent Loop 升级为更容易调试、可审计的版本：支持工具调用、结构化 trace、统一工具错误、错误恢复提示、Sandbox / Permission、Eval Harness，以及初版 context compression。
 
+## Workspace Web MVP
+
+仓库现在包含一个 FastAPI + React Workspace 应用：
+
+- 邀请账号登录与按 userId 隔离的 Workspace。
+- SQLite WAL 保存 Workspace、Run、事件、文件 diff 和反馈。
+- `list_files`、`read_file`、`write_file`、`search_files`、`run_shell` 五个 Workspace 绑定工具。
+- 每个 Run 使用离线、非 root、有限资源的 Docker 容器；容器只挂载 Run 的 staging 副本。
+- SSE 实时展示 Agent 消息、工具调用、输出和文件变化，并可在刷新后回放。
+- Run 完成后先审阅 diff，再选择 Apply 或 Discard。
+
+### 本地启动
+
+Python API：
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m uvicorn workspace_app.main:create_app --factory --reload
+```
+
+未配置 `INVITE_USERS_JSON` 的开发环境默认账号为 `demo / demo`。另开终端启动 React：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+真实 Run 需要 Docker。构建隔离执行镜像：
+
+```bash
+docker build -f Dockerfile.sandbox -t workspace-sandbox:latest .
+docker info
+```
+
+### 邀请账号
+
+为每个邀请用户生成 PBKDF2 密码哈希：
+
+```bash
+python3 -m workspace_app.auth 'replace-with-password'
+```
+
+把输出写入单行 JSON 环境变量：
+
+```text
+INVITE_USERS_JSON='[{"id":"user-1","username":"alice","passwordHash":"pbkdf2_sha256$..."}]'
+```
+
+生产环境还必须设置至少 32 字符的 `SESSION_SECRET`，并通过 HTTPS 使用 Secure、HttpOnly、SameSite=Strict Cookie。
+
+### VPS 部署
+
+VPS 需要 Docker Engine、Compose v2、一个已解析到服务器的域名，以及至少 2 vCPU / 4 GB RAM。复制 `.env.example` 为 `.env` 并填写变量，然后：
+
+```bash
+mkdir -p /srv/workspace-agent/data
+docker compose --profile build-only build sandbox-image
+docker compose build web
+docker compose up -d web caddy
+docker compose ps
+```
+
+`HOST_DATA_ROOT` 必须是 VPS 上的绝对路径，并与挂载到 Web 容器的持久目录一致。控制面会访问 Docker socket 来创建 Run 容器；Sandbox 本身永远不会挂载 Docker socket，也不会接收 OpenAI 密钥。
+
+### Workspace API
+
+核心接口：
+
+```text
+POST   /api/auth/login
+GET    /api/workspaces
+POST   /api/workspaces
+GET    /api/workspaces/:id/files
+GET    /api/workspaces/:id/files/*
+PUT    /api/workspaces/:id/files/*
+POST   /api/workspaces/:id/runs
+GET    /api/runs/:runId
+GET    /api/runs/:runId/events
+GET    /api/runs/:runId/diff
+POST   /api/runs/:runId/cancel
+POST   /api/runs/:runId/apply
+POST   /api/runs/:runId/discard
+PUT    /api/runs/:runId/feedback
+```
+
 ## 当前能力
 
 - 使用 OpenAI Chat Completions native tools。

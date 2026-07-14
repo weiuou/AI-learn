@@ -296,6 +296,12 @@ def add_event(trace, event_type, attributes=None, step=None):
     store = trace.get("_store")
     if store is not None:
         store.append_event(trace["task_id"], event)
+    event_sink = trace.get("_event_sink")
+    if event_sink:
+        try:
+            event_sink(event)
+        except Exception as exc:
+            trace["_event_sink_error"] = str(exc)
     return event
 
 
@@ -435,7 +441,7 @@ def base_system_message():
         "role": "system",
         "content": (
             "你是一个最小 Agent Harness。"
-            "你可以通过工具读取文件、写文件、运行低风险 shell 命令。"
+            "你可以使用当前 Run 提供的项目工具读取、搜索、写入文件，并在可用时运行隔离 shell 命令。"
             "工具返回的是统一 JSON：ok/result/error_type/message/recoverable/suggestion。"
             "你每轮会收到 Context Pack，它是任务状态和历史摘要，不是完整聊天历史。"
             "遇到 recoverable=true 的错误时，优先根据 suggestion 自己恢复，例如列目录、搜索文件、修正参数。"
@@ -658,6 +664,9 @@ def run_agent(
     clock=None,
     store: RunStore | None = None,
     segment_id: str | None = None,
+    openai_tools=None,
+    cancel_check=None,
+    model_timeout=60,
 ):
     if store is None and run_dir:
         store = FileRunStore(Path(run_dir).parent)
@@ -696,10 +705,34 @@ def run_agent(
     loop_detector = loop_detector or LoopDetector()
     model_client = model_client or get_client()
     tool_executor = tool_executor or execute_tool
+    openai_tools = openai_tools or OPENAI_TOOLS
+    cancel_check = cancel_check or (lambda: False)
     context_pack = prepare_context_pack(trace, task_state, start_step, run_dir=run_dir)
+
+    def finish_cancelled(current_step):
+        answer = "任务已由用户取消。"
+        add_event(trace, "run_cancelled", {"step": current_step, "user_goal": user_task}, step=current_step)
+        add_event(
+            trace,
+            "final_answer",
+            {
+                "step": current_step,
+                "user_goal": user_task,
+                "answer": answer,
+                "exit_reason": "cancelled",
+                "token_estimate": estimate_text_tokens(answer),
+            },
+            step=current_step,
+        )
+        update_budget_summary(trace, budget_guard)
+        packed = prepare_context_pack(trace, task_state, current_step, run_dir=run_dir)
+        persist_checkpoint(trace, task_state, run_dir, packed, step=current_step)
+        return answer
 
     step = start_step
     while True:
+        if cancel_check():
+            return finish_cancelled(step)
         context_pack = prepare_context_pack(trace, task_state, step, run_dir=run_dir)
         messages = build_model_messages(user_task, context_pack, recent_messages)
         messages = maybe_compress_context(messages, trace, step)
@@ -748,9 +781,13 @@ def run_agent(
         completion = model_client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=OPENAI_TOOLS,
+            tools=openai_tools,
             tool_choice="auto",
+            timeout=model_timeout,
         )
+
+        if cancel_check():
+            return finish_cancelled(step)
 
         message = completion.choices[0].message
         usage = normalize_usage(getattr(completion, "usage", None))
@@ -840,6 +877,8 @@ def run_agent(
         pending_recovery_hint = None
 
         for tool_call in tool_calls:
+            if cancel_check():
+                return finish_cancelled(step)
             tool_name = tool_call.function.name
             raw_args = tool_call.function.arguments
             tool_metadata = {
@@ -863,19 +902,12 @@ def run_agent(
             budget_guard.record_tool_call()
             update_budget_summary(trace, budget_guard)
 
+            parse_error = None
             try:
                 tool_args = json.loads(raw_args)
             except json.JSONDecodeError as e:
                 tool_args = raw_args
-                tool_result = tool_error(
-                    "INVALID_ARGUMENTS",
-                    f"Invalid tool arguments JSON: {e}",
-                    True,
-                    "Call the tool again with valid JSON arguments.",
-                )
-            else:
-                tool_result, tool_metadata = tool_executor({"tool": tool_name, "args": tool_args})
-
+                parse_error = e
             add_event(
                 trace,
                 "tool_called",
@@ -886,11 +918,26 @@ def run_agent(
                     "tool_call.id": tool_call.id,
                     "tool_call.name": tool_name,
                     "tool_call.arguments": tool_args,
-                    **tool_metadata,
+                    "risk_level": "pending",
+                    "approval_required": False,
+                    "approved": None,
+                    "policy_decision": "pending",
+                    "risk_reason": "tool execution has started",
+                    "truncated": False,
                     "token_estimate": estimate_text_tokens(tool_args),
                 },
                 step=step,
             )
+
+            if parse_error is not None:
+                tool_result = tool_error(
+                    "INVALID_ARGUMENTS",
+                    f"Invalid tool arguments JSON: {parse_error}",
+                    True,
+                    "Call the tool again with valid JSON arguments.",
+                )
+            else:
+                tool_result, tool_metadata = tool_executor({"tool": tool_name, "args": tool_args})
 
             error = None if tool_result.get("ok") else {
                 "error_type": tool_result.get("error_type"),

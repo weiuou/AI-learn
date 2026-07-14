@@ -3,4 +3,9 @@ traces/
 runs/
 .env
 .pytest_cache/
+__pycache__/
+*.py[cod]
 evals/
+data/
+frontend/dist/
+frontend/node_modules/
